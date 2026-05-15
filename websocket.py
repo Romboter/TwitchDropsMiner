@@ -247,7 +247,17 @@ class Websocket:
         ws = self._ws.get_with_default(None)
         assert ws is not None
         while True:
-            raw_message: aiohttp.WSMessage = await ws.receive(timeout=timeout)
+            try:
+                raw_message: aiohttp.WSMessage = await ws.receive(timeout=timeout)
+            except (
+                aiohttp.ClientConnectionResetError,
+                aiohttp.ClientConnectionError,
+                ConnectionResetError,
+            ):
+                # Connection closed/reset during receive (e.g., pong handling on closing transport).
+                # This is a normal condition during shutdown or race conditions.
+                raise WebsocketClosed(received=False)
+
             ws_logger.debug(f"Websocket[{self._idx}] received: {raw_message}")
             if raw_message.type is WSMsgType.TEXT:
                 message: JsonType = json.loads(raw_message.data)
@@ -323,7 +333,15 @@ class Websocket:
         assert ws is not None
         if message["type"] != "PING":
             message["nonce"] = create_nonce(CHARS_ASCII, 30)
-        await ws.send_json(message, dumps=json_minify)
+        try:
+            await ws.send_json(message, dumps=json_minify)
+        except (
+            aiohttp.ClientConnectionResetError,
+            aiohttp.ClientConnectionError,
+            ConnectionResetError,
+        ):
+            # Connection closed/reset during send. Treat as normal reconnect condition.
+            raise WebsocketClosed(received=False)
         ws_logger.debug(f"Websocket[{self._idx}] sent: {message}")
 
 

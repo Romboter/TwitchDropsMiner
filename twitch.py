@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import asyncio
 import logging
+from pathlib import Path
 from time import time
 from copy import deepcopy
 from itertools import chain
@@ -75,6 +76,10 @@ class SkipExtraJsonDecoder(json.JSONDecoder):
 
 
 SAFE_LOADS = lambda s: json.loads(s, cls=SkipExtraJsonDecoder)
+
+
+def _cookie_path_for_username(username: str) -> Path:
+    return COOKIES_PATH.with_name(f"cookie.{username}.jar")
 
 
 class _AuthState:
@@ -156,7 +161,7 @@ class _AuthState:
                 }
                 while True:
                     # sleep first, not like the user is gonna enter the code *that* fast
-                    await asyncio.sleep(interval)
+                    await self._twitch.gui.coro_unless_closed(asyncio.sleep(interval))
                     async with self._twitch.request(
                         "POST",
                         "https://id.twitch.tv/oauth2/token",
@@ -404,17 +409,20 @@ class _AuthState:
                 # otherwise, we need to delete the entire cookie file and clear the jar
                 logger.info("Cookie client ID mismatch")
                 jar.clear()
-                COOKIES_PATH.unlink(missing_ok=True)
+                cookie_path = self._twitch._get_cookie_path()
+                if cookie_path is not None:
+                    cookie_path.unlink(missing_ok=True)
             else:
                 raise RuntimeError("Login verification failure (step #1)")
             self.user_id = int(validate_response["user_id"])
-            username = validate_response.get("login")
+            username = validate_response["login"]
             cookie["persistent"] = str(self.user_id)
+            cookie_path = self._twitch._set_cookie_path_for_username(username)
             logger.info(f"Login successful, user ID: {self.user_id}, username: {username}")
             login_form.update(_("gui", "login", "logged_in"), self.user_id, username)
             # update our cookie and save it
             jar.update_cookies(cookie, client_info.CLIENT_URL)
-            jar.save(COOKIES_PATH)
+            jar.save(cookie_path)
         self._logged_in.set()
 
     def invalidate(self):
@@ -424,6 +432,12 @@ class _AuthState:
 class Twitch:
     def __init__(self, settings: Settings):
         self.settings: Settings = settings
+        self._cookie_path: Path | None = None
+        self._pending_cookie_path: Path | None = None
+        self._pending_new_login: bool = False
+        self._skip_cookie_load: bool = False
+        self._full_reload_requested: bool = False
+        self._reload_requested = asyncio.Event()
         # State management
         self._state: State = State.IDLE
         self._state_change = asyncio.Event()
@@ -451,6 +465,98 @@ class Twitch:
         # Maintenance task
         self._mnt_task: asyncio.Task[None] | None = None
 
+    def get_available_cookie_paths(self) -> list[Path]:
+        cookie_paths = sorted(
+            COOKIES_PATH.parent.glob("cookie.*.jar"),
+            key=lambda path: path.name.lower(),
+        )
+        if COOKIES_PATH.exists():
+            cookie_paths.append(COOKIES_PATH)
+        return cookie_paths
+
+    def get_selected_cookie_path(self) -> Path | None:
+        if self._pending_new_login:
+            return None
+        if self._pending_cookie_path is not None:
+            return self._pending_cookie_path
+        return self._get_cookie_path()
+
+    def _get_cookie_path(self) -> Path | None:
+        if self._skip_cookie_load:
+            return None
+        if self._cookie_path is not None:
+            return self._cookie_path
+        cookie_name = self.settings.cookie_name
+        if cookie_name:
+            selected_cookie_path = COOKIES_PATH.parent / cookie_name
+            if selected_cookie_path.exists():
+                self._cookie_path = selected_cookie_path
+                return self._cookie_path
+            self.settings.cookie_name = ''
+        cookie_paths = sorted(
+            COOKIES_PATH.parent.glob("cookie.*.jar"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if cookie_paths:
+            self._cookie_path = cookie_paths[0]
+            if len(cookie_paths) > 1:
+                logger.warning(
+                    f"Multiple cookie jars found, defaulting to: {self._cookie_path.name}"
+                )
+        elif COOKIES_PATH.exists():
+            self._cookie_path = COOKIES_PATH
+        return self._cookie_path
+
+    def _set_cookie_path(self, cookie_path: Path, *, migrate_legacy: bool = False) -> Path:
+        old_cookie_path = self._cookie_path
+        self._cookie_path = cookie_path
+        self.settings.cookie_name = cookie_path.name
+        if migrate_legacy and old_cookie_path == COOKIES_PATH and old_cookie_path != self._cookie_path:
+            old_cookie_path.unlink(missing_ok=True)
+        return self._cookie_path
+
+    def _set_cookie_path_for_username(self, username: str) -> Path:
+        return self._set_cookie_path(_cookie_path_for_username(username), migrate_legacy=True)
+
+    def request_full_reload(self) -> None:
+        self._full_reload_requested = True
+        self._reload_requested.set()
+        self._state_change.set()
+
+    async def wait_until_reload_requested(self) -> None:
+        await self._reload_requested.wait()
+
+    def _clear_full_reload_request(self) -> None:
+        self._full_reload_requested = False
+        self._reload_requested.clear()
+
+    def select_cookie(self, cookie_name: str) -> bool:
+        cookie_path = COOKIES_PATH.parent / cookie_name
+        if not cookie_path.exists():
+            return False
+        if self.get_selected_cookie_path() == cookie_path:
+            return False
+        self._pending_cookie_path = cookie_path
+        self.settings.cookie_name = cookie_path.name
+        self.settings.save(force=True)
+        logger.info(f"Switching to cookie jar: {cookie_path.name}")
+        self.request_full_reload()
+        return True
+
+    def request_new_login(self) -> None:
+        self._pending_new_login = True
+        self._pending_cookie_path = None
+        self.settings.cookie_name = ''
+        self.settings.save(force=True)
+        logger.info("Switching to new login flow")
+        self.request_full_reload()
+
+    def _consume_full_reload_request(self) -> None:
+        if self._full_reload_requested:
+            self._clear_full_reload_request()
+            raise ReloadRequest()
+
     async def get_session(self) -> aiohttp.ClientSession:
         if (session := self._session) is not None:
             if session.closed:
@@ -458,9 +564,11 @@ class Twitch:
             return session
         # load in cookies
         cookie_jar = aiohttp.CookieJar()
+        cookie_path = self._get_cookie_path()
+        self._skip_cookie_load = False
         try:
-            if COOKIES_PATH.exists():
-                cookie_jar.load(COOKIES_PATH)
+            if cookie_path is not None and cookie_path.exists():
+                cookie_jar.load(cookie_path)
         except Exception:
             # if loading in the cookies file ends up in an error, just ignore it
             # clear the jar, just in case
@@ -505,7 +613,9 @@ class Twitch:
             for cookie_key, cookie in list(cookie_jar._cookies.items()):
                 if not cookie:
                     del cookie_jar._cookies[cookie_key]
-            cookie_jar.save(COOKIES_PATH)
+            cookie_path = self._cookie_path
+            if cookie_path is not None:
+                cookie_jar.save(cookie_path)
             await self._session.close()
             self._session = None
         self._drops.clear()
@@ -590,7 +700,15 @@ class Twitch:
                 await self._run()
                 break
             except ReloadRequest:
+                self._clear_full_reload_request()
                 await self.shutdown()
+                if self._pending_new_login:
+                    self._cookie_path = None
+                    self._pending_new_login = False
+                    self._skip_cookie_load = True
+                elif self._pending_cookie_path is not None:
+                    self._cookie_path = self._pending_cookie_path
+                    self._pending_cookie_path = None
             except ExitRequest:
                 break
             except aiohttp.ContentTypeError as exc:
@@ -623,6 +741,7 @@ class Twitch:
         channels: Final[OrderedDict[int, Channel]] = self.channels
         self.change_state(State.INVENTORY_FETCH)
         while True:
+            self._consume_full_reload_request()
             if self._state is State.IDLE:
                 if self.settings.dump:
                     self.gui.close()
@@ -1273,8 +1392,7 @@ class Twitch:
             finally:
                 if response is not None:
                     response.release()
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.gui.wait_until_closed(), timeout=delay)
+            await self.gui.coro_unless_closed(asyncio.sleep(delay))
 
     @overload
     async def gql_request(self, ops: GQLOperation) -> JsonType:

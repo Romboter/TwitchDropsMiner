@@ -35,7 +35,7 @@ if sys.platform == "darwin":
 
 from translate import _
 from cache import ImageCache
-from exceptions import MinerException, ExitRequest
+from exceptions import MinerException, ExitRequest, ReloadRequest
 from utils import resource_path, set_root_icon, webopen, Game, _T
 from constants import (
     MAX_INT,
@@ -524,16 +524,46 @@ class LoginData:
 
 
 class LoginForm:
+    EMPTY_COOKIES_TEXT = "No cookies found"
+    LEGACY_COOKIE_TEXT = "Legacy (cookies.jar)"
+
     def __init__(self, manager: GUIManager, master: ttk.Widget):
         self._manager = manager
         self._var = StringVar(master)
+        self._cookie_var = StringVar(master, self.EMPTY_COOKIES_TEXT)
+        self._cookie_paths: dict[str, Path] = {}
         frame = ttk.LabelFrame(master, text=_("gui", "login", "name"), padding=(4, 0, 4, 4))
         frame.grid(column=1, row=1, sticky="nsew", padx=2)
         frame.columnconfigure(0, weight=2)
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(4, weight=1)
+        frame.rowconfigure(5, weight=1)
         ttk.Label(frame, text=_("gui", "login", "labels")).grid(column=0, row=0)
         ttk.Label(frame, textvariable=self._var, justify="center").grid(column=1, row=0)
+        ttk.Label(frame, text="Cookie").grid(column=0, row=1, sticky="w")
+        ttk.Button(frame, text="Refresh", command=self.refresh_cookies).grid(
+            column=1, row=1, sticky="e"
+        )
+        self._cookie_select = ttk.Combobox(
+            frame,
+            state="readonly",
+            exportselection=False,
+            textvariable=self._cookie_var,
+            values=[self.EMPTY_COOKIES_TEXT],
+            width=28,
+        )
+        self._cookie_select.grid(column=0, row=2, columnspan=2, sticky="ew")
+        self._cookie_select.bind("<<ComboboxSelected>>", self._cookie_selected)
+        self._cookie_button = ttk.Button(
+            frame, text="Switch Cookie", command=self._switch_cookie, state="disabled"
+        )
+        self._cookie_button.grid(column=0, row=3, columnspan=2, sticky="ew")
+        ttk.Button(frame, text="New Login", command=self._new_login).grid(
+            column=0, row=4, sticky="ew"
+        )
+        self._disconnect_button = ttk.Button(
+            frame, text="Disconnect", command=self._disconnect, state="disabled"
+        )
+        self._disconnect_button.grid(column=1, row=4, sticky="ew")
         self._login_entry = PlaceholderEntry(frame, placeholder=_("gui", "login", "username"))
         # self._login_entry.grid(column=0, row=1, columnspan=2)
         self._pass_entry = PlaceholderEntry(
@@ -547,8 +577,72 @@ class LoginForm:
         self._button = ttk.Button(
             frame, text=_("gui", "login", "button"), command=self._confirm.set, state="disabled"
         )
-        self._button.grid(column=0, row=4, columnspan=2)
+        self._button.grid(column=0, row=5, columnspan=2)
         self.update(_("gui", "login", "logged_out"), None)
+        self.refresh_cookies()
+
+    @classmethod
+    def _cookie_label(cls, cookie_path: Path) -> str:
+        if cookie_path.name == "cookies.jar":
+            return cls.LEGACY_COOKIE_TEXT
+        if cookie_path.name.startswith("cookie.") and cookie_path.name.endswith(".jar"):
+            return cookie_path.name.removeprefix("cookie.").removesuffix(".jar")
+        return cookie_path.name
+
+    def _cookie_selected(self, event: tk.Event[ttk.Combobox]) -> None:
+        self._update_cookie_button()
+
+    def _update_cookie_button(self) -> None:
+        cookie_path = self._cookie_paths.get(self._cookie_var.get())
+        selected_cookie_path = self._manager._twitch.get_selected_cookie_path()
+        if cookie_path is None or cookie_path == selected_cookie_path:
+            self._cookie_button.config(state="disabled")
+        else:
+            self._cookie_button.config(state="normal")
+
+    def refresh_cookies(self) -> None:
+        cookie_paths = self._manager._twitch.get_available_cookie_paths()
+        self._cookie_paths = {self._cookie_label(path): path for path in cookie_paths}
+        if not self._cookie_paths:
+            self._cookie_select.config(state="disabled", values=[self.EMPTY_COOKIES_TEXT])
+            self._cookie_var.set(self.EMPTY_COOKIES_TEXT)
+            self._cookie_button.config(state="disabled")
+            return
+        cookie_labels = list(self._cookie_paths.keys())
+        self._cookie_select.config(state="readonly", values=cookie_labels)
+        selected_cookie_path = self._manager._twitch.get_selected_cookie_path()
+        if selected_cookie_path is not None:
+            selected_label = self._cookie_label(selected_cookie_path)
+        else:
+            selected_label = cookie_labels[0]
+        if selected_label not in self._cookie_paths:
+            selected_label = cookie_labels[0]
+        self._cookie_var.set(selected_label)
+        self._update_cookie_button()
+
+    def _switch_cookie(self) -> None:
+        cookie_path = self._cookie_paths.get(self._cookie_var.get())
+        if cookie_path is None:
+            return
+        if self._manager._twitch.select_cookie(cookie_path.name):
+            self.refresh_cookies()
+
+    def _new_login(self) -> None:
+        self._manager._twitch.request_new_login()
+        self.refresh_cookies()
+
+    def _disconnect(self) -> None:
+        self._manager._twitch._auth_state.clear()
+        self.update(_("gui", "login", "logged_out"), None)
+
+    async def _connect_async(self) -> None:
+        try:
+            await self._manager._twitch.get_auth()
+        except Exception:
+            pass
+
+    def _connect(self) -> None:
+        asyncio.create_task(self._connect_async())
 
     def clear(self, login: bool = False, password: bool = False, token: bool = False):
         clear_all = not login and not password and not token
@@ -607,13 +701,16 @@ class LoginForm:
     def update(self, status: str, user_id: int | None, username: str | None = None):
         if user_id is not None:
             user_str = str(user_id)
+            self._disconnect_button.config(state="normal", text="Disconnect", command=self._disconnect)
         else:
             user_str = "-"
+            self._disconnect_button.config(state="normal", text="Connect", command=self._connect)
         if username:
             display = f"{status}\n{user_str}\n{username}"
         else:
             display = f"{status}\n{user_str}"
         self._var.set(display)
+        self.refresh_cookies()
 
 
 class _BaseVars(TypedDict):
@@ -2343,7 +2440,11 @@ class GUIManager:
 
     async def coro_unless_closed(self, coro: abc.Awaitable[_T]) -> _T:
         # In Python 3.11, we need to explicitly wrap awaitables
-        tasks = [asyncio.ensure_future(coro), asyncio.ensure_future(self._close_requested.wait())]
+        tasks = [
+            asyncio.ensure_future(coro),
+            asyncio.ensure_future(self._close_requested.wait()),
+            asyncio.ensure_future(self._twitch.wait_until_reload_requested()),
+        ]
         done: set[asyncio.Task[Any]]
         pending: set[asyncio.Task[Any]]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -2351,6 +2452,8 @@ class GUIManager:
             task.cancel()
         if self._close_requested.is_set():
             raise ExitRequest()
+        if self._twitch._full_reload_requested:
+            raise ReloadRequest()
         return await next(iter(done))
 
     def prevent_close(self):

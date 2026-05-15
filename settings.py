@@ -15,6 +15,7 @@ class SettingsFile(TypedDict):
     proxy: URL
     language: str
     dark_mode: bool
+    cookie_name: str
     exclude: set[str]
     priority: list[str]
     autostart_tray: bool
@@ -30,6 +31,7 @@ default_settings: SettingsFile = {
     "priority": [],
     "exclude": set(),
     "dark_mode": False,
+    "cookie_name": '',
     "autostart_tray": False,
     "connection_quality": 1,
     "language": DEFAULT_LANG,
@@ -53,6 +55,7 @@ class Settings:
     proxy: URL
     language: str
     dark_mode: bool
+    cookie_name: str
     exclude: set[str]
     priority: list[str]
     autostart_tray: bool
